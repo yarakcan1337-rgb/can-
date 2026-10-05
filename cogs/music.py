@@ -1,8 +1,12 @@
 import asyncio
 import os
 import re
+import select
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
 from collections import deque
 from dataclasses import dataclass
 
@@ -46,23 +50,31 @@ if _clients:
     YTDL_OPTS["extractor_args"] = {"youtube": {"player_client": _clients}}
 USE_COOKIES = os.getenv("YT_USE_COOKIES", "1") != "0"
 
-# YouTube "bot değilsin" doğrulaması isterse: proje klasörüne cookies.txt koyulursa kullanılır.
-# yt-dlp dosyayı geri yazmak isteyebildiği için yazılabilir bir kopya (/tmp) üzerinden kullanıyoruz.
+# YouTube "bot değilsin" doğrulaması isterse çerez kullanılır.
+# ÖNERİLEN: cookies.txt içeriğini Railway > Variables > YT_COOKIES olarak yapıştır (GitHub'a koyma!).
+# Yedek: proje klasöründe cookies.txt varsa o kullanılır.
+# yt-dlp dosyayı geri yazmak isteyebildiği için yazılabilir bir kopya (/tmp) kullanıyoruz.
 _COOKIES_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt")
+_COOKIES_COPY = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
 COOKIES_LOADED = False
-COOKIES_INFO = "cookies.txt YOK (projeye yüklenmemiş)"
-if USE_COOKIES and os.path.exists(_COOKIES_SRC):
+COOKIES_INFO = "çerez YOK (YT_COOKIES ya da cookies.txt yok)"
+if USE_COOKIES:
     try:
-        _copy = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        shutil.copyfile(_COOKIES_SRC, _copy)
-        YTDL_OPTS["cookiefile"] = _copy
-        _text = open(_COOKIES_SRC, encoding="utf-8", errors="ignore").read()
-        _lines = [l for l in _text.splitlines() if l.strip() and not l.startswith("#")]
-        _has_login = "SAPISID" in _text or "__Secure-3PSID" in _text
-        COOKIES_LOADED = True
-        COOKIES_INFO = f"cookies.txt BULUNDU ({len(_lines)} çerez, giriş çerezi: {'var' if _has_login else 'YOK'})"
+        _text = os.getenv("YT_COOKIES", "").replace("\\n", "\n")
+        _from = "YT_COOKIES değişkeni"
+        if not _text.strip() and os.path.exists(_COOKIES_SRC):
+            _text = open(_COOKIES_SRC, encoding="utf-8", errors="ignore").read()
+            _from = "cookies.txt"
+        if _text.strip():
+            with open(_COOKIES_COPY, "w", encoding="utf-8") as _f:
+                _f.write(_text)
+            YTDL_OPTS["cookiefile"] = _COOKIES_COPY
+            _lines = [l for l in _text.splitlines() if l.strip() and not l.startswith("#")]
+            _has_login = "SAPISID" in _text or "__Secure-3PSID" in _text
+            COOKIES_LOADED = True
+            COOKIES_INFO = f"çerez BULUNDU ({_from}, {len(_lines)} çerez, giriş çerezi: {'var' if _has_login else 'YOK'})"
     except Exception as _e:  # noqa: BLE001
-        COOKIES_INFO = f"cookies.txt okunamadı: {_e}"
+        COOKIES_INFO = f"çerez okunamadı: {_e}"
 
 BOT_CHECK_HINTS = ("not a bot", "sign in to confirm")
 
@@ -91,6 +103,96 @@ def ffmpeg_opts(headers: dict | None = None) -> dict:
         if hdr:
             before = f'-headers "{hdr}" ' + before
     return {"before_options": before, "options": "-vn"}
+
+# ---------- yt-dlp -> ffmpeg pipe (403'ü aşmak için) ----------
+# Linki doğrudan ffmpeg'e vermek googlevideo'da 403 verebiliyor. Bunun yerine sesi yt-dlp indirir
+# (kendi istemci/PO token/parçalı indirme mantığıyla) ve ffmpeg'e stdin üzerinden aktarır.
+# YT_MODE=url yaparsan eski yönteme (linki doğrudan ffmpeg'e verme) döner.
+YT_MODE = os.getenv("YT_MODE", "pipe").lower()
+PIPE_START_TIMEOUT = 30  # saniye: ilk ses verisi bu sürede gelmezse sıradaki istemciyi dene
+
+
+def _client_attempts() -> list[list[str] | None]:
+    if _clients:
+        return [_clients]
+    return [None, ["android_vr"], ["tv"]]  # None = yt-dlp varsayılanı
+
+
+def _ytdlp_cmd(url: str, clients: list[str] | None) -> list[str]:
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "-f", "bestaudio/best", "-o", "-", "-q", "--no-warnings",
+        "--no-playlist", "--retries", "3", "--fragment-retries", "3",
+        "--js-runtimes", "deno", "--remote-components", "ejs:github",
+    ]
+    if "cookiefile" in YTDL_OPTS:
+        cmd += ["--cookies", YTDL_OPTS["cookiefile"]]
+    if clients:
+        cmd += ["--extractor-args", f"youtube:player_client={','.join(clients)}"]
+    cmd.append(url)
+    return cmd
+
+
+class PipeSource(discord.FFmpegPCMAudio):
+    """yt-dlp çıktısını ffmpeg'e aktaran ses kaynağı; bitince yt-dlp sürecini de kapatır."""
+
+    def __init__(self, proc: subprocess.Popen):
+        self._ytproc = proc
+        super().__init__(proc.stdout, pipe=True, options="-vn")
+
+    def cleanup(self):
+        super().cleanup()
+        try:
+            self._ytproc.kill()
+            self._ytproc.stdout.close()
+        except Exception:  # noqa: BLE001
+            pass
+        threading.Thread(target=self._ytproc.wait, daemon=True).start()
+
+
+def _start_pipe(url: str, clients: list[str] | None) -> tuple[subprocess.Popen | None, str]:
+    """yt-dlp'yi başlatır, ilk veri gelene kadar bekler. Başarısızsa (None, hata metni) döner."""
+    proc = subprocess.Popen(_ytdlp_cmd(url, clients), stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    err_lines: list[str] = []
+
+    def drain():
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", "ignore").strip()
+            if line:
+                err_lines.append(line)
+                print(f"[yt-dlp pipe] {line}")
+
+    threading.Thread(target=drain, daemon=True).start()
+
+    # stdout okunabilir olana (veri ya da EOF) kadar bekle; veriyi tüketmeden (peek yok) kontrol et
+    ready, _, _ = select.select([proc.stdout], [], [], PIPE_START_TIMEOUT)
+    if ready:
+        try:
+            proc.wait(timeout=0.5)  # hemen çıktıysa hata mı bitiş mi anla
+            failed = proc.returncode != 0
+        except subprocess.TimeoutExpired:
+            failed = False  # hâlâ çalışıyor ve veri geliyor: başarılı
+        if not failed:
+            return proc, ""
+    proc.kill()
+    proc.wait()
+    return None, (err_lines[-1] if err_lines else "yt-dlp ses verisi vermedi (zaman aşımı)")
+
+
+async def open_pipe_source(url: str) -> discord.AudioSource:
+    loop = asyncio.get_running_loop()
+    last_err = ""
+    for clients in _client_attempts():
+        proc, err = await loop.run_in_executor(None, _start_pipe, url, clients)
+        if proc:
+            print(f"[müzik] pipe modu OK (istemci: {','.join(clients) if clients else 'varsayılan'})")
+            return PipeSource(proc)
+        last_err = err
+        print(f"[müzik] pipe başarısız (istemci: {clients or 'varsayılan'}): {err[:200]}")
+        if is_bot_check(RuntimeError(err)):
+            break  # bot kontrolünde diğer istemcileri denemek engeli sertleştirir
+    raise RuntimeError(last_err or "Ses alınamadı.")
+
 SPOTIFY_RE = re.compile(
     r"https?://open\.spotify\.com/(?:intl-[a-z]+/)?(track|album|playlist)/([A-Za-z0-9]+)"
 )
@@ -238,7 +340,10 @@ class Music(commands.Cog):
                     track.http_headers = info.get("http_headers")
                 m = re.search(r"[?&]c=([A-Z_0-9]+)", track.stream_url or "")
                 print(f"[müzik] istemci: {m.group(1) if m else '?'} | header: {'var' if track.http_headers else 'yok'}")
-                source = discord.FFmpegPCMAudio(track.stream_url, **ffmpeg_opts(track.http_headers))
+                if YT_MODE == "pipe":
+                    source = await open_pipe_source(track.webpage_url or track.query)
+                else:
+                    source = discord.FFmpegPCMAudio(track.stream_url, **ffmpeg_opts(track.http_headers))
             except Exception as e:  # noqa: BLE001
                 if is_bot_check(e):
                     # Kalan şarkıları denemek işe yaramaz ve engeli sertleştirir: tek mesajla bırak.
