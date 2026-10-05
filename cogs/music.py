@@ -29,11 +29,16 @@ class _YTLogger:
         print(f"[yt-dlp hata] {msg}")
 
 
+print(f"[müzik] deno: {shutil.which('deno')} | yt-dlp: {yt_dlp.version.__version__}")
+
 YTDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "default_search": "ytsearch",
     "logger": _YTLogger(),
+    # YouTube "n challenge" çözümü için JS runtime + çözücü script
+    "js_runtimes": {"deno": {}},
+    "remote_components": ["ejs:github"],
 }
 
 # YouTube "bot değilsin" doğrulaması isterse: proje klasörüne cookies.txt koyulursa kullanılır.
@@ -95,8 +100,8 @@ def fmt_duration(sec) -> str:
 async def extract(query: str) -> dict:
     """yt-dlp ile bir link ya da arama sorgusunu çözer (bloklamaması için thread'de çalışır)."""
 
-    def run():
-        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+    def run(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
         if info and "entries" in info:
             entries = [e for e in info["entries"] if e]
@@ -107,7 +112,15 @@ async def extract(query: str) -> dict:
             raise RuntimeError("Sonuç bulunamadı.")
         return info
 
-    return await asyncio.get_running_loop().run_in_executor(None, run)
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, run, YTDL_OPTS)
+    except Exception as e:  # noqa: BLE001
+        # Çerez bozulduysa çerezsiz bir kez daha dene
+        if "needs to be reloaded" in str(e) and "cookiefile" in YTDL_OPTS:
+            opts = {k: v for k, v in YTDL_OPTS.items() if k != "cookiefile"}
+            return await loop.run_in_executor(None, run, opts)
+        raise
 
 
 def make_spotify():
