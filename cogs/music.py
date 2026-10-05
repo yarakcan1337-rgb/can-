@@ -40,13 +40,18 @@ YTDL_OPTS = {
     "js_runtimes": {"deno": {}},
     "remote_components": ["ejs:github"],
 }
+# Railway Variables ile ayarlanabilir: YT_CLIENTS=android_vr,web_safari  |  YT_USE_COOKIES=0
+_clients = [c.strip() for c in os.getenv("YT_CLIENTS", "").split(",") if c.strip()]
+if _clients:
+    YTDL_OPTS["extractor_args"] = {"youtube": {"player_client": _clients}}
+USE_COOKIES = os.getenv("YT_USE_COOKIES", "1") != "0"
 
 # YouTube "bot değilsin" doğrulaması isterse: proje klasörüne cookies.txt koyulursa kullanılır.
 # yt-dlp dosyayı geri yazmak isteyebildiği için yazılabilir bir kopya (/tmp) üzerinden kullanıyoruz.
 _COOKIES_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt")
 COOKIES_LOADED = False
 COOKIES_INFO = "cookies.txt YOK (projeye yüklenmemiş)"
-if os.path.exists(_COOKIES_SRC):
+if USE_COOKIES and os.path.exists(_COOKIES_SRC):
     try:
         _copy = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
         shutil.copyfile(_COOKIES_SRC, _copy)
@@ -75,10 +80,17 @@ def bot_check_message() -> str:
     return msg
 
 
-FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
+_HDR_KEYS = ("user-agent", "accept", "accept-language", "referer", "origin")
+
+
+def ffmpeg_opts(headers: dict | None = None) -> dict:
+    """yt-dlp'nin kullandığı header'ları ffmpeg'e de verir (googlevideo 403'ü önler)."""
+    before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    if headers:
+        hdr = "".join(f"{k}: {v}\r\n" for k, v in headers.items() if k.lower() in _HDR_KEYS)
+        if hdr:
+            before = f'-headers "{hdr}" ' + before
+    return {"before_options": before, "options": "-vn"}
 SPOTIFY_RE = re.compile(
     r"https?://open\.spotify\.com/(?:intl-[a-z]+/)?(track|album|playlist)/([A-Za-z0-9]+)"
 )
@@ -157,6 +169,7 @@ class Track:
     stream_url: str | None = None   # çalma anında çözülür (linkler süreli olduğu için)
     webpage_url: str | None = None
     duration: int | None = None
+    http_headers: dict | None = None
 
 
 class GuildState:
@@ -204,6 +217,7 @@ class Music(commands.Cog):
                 stream_url=info.get("url"),
                 webpage_url=info.get("webpage_url"),
                 duration=info.get("duration"),
+                http_headers=info.get("http_headers"),
             )
         ]
 
@@ -221,7 +235,10 @@ class Music(commands.Cog):
                     track.title = info.get("title", track.title)
                     track.webpage_url = info.get("webpage_url")
                     track.duration = info.get("duration")
-                source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTS)
+                    track.http_headers = info.get("http_headers")
+                m = re.search(r"[?&]c=([A-Z_0-9]+)", track.stream_url or "")
+                print(f"[müzik] istemci: {m.group(1) if m else '?'} | header: {'var' if track.http_headers else 'yok'}")
+                source = discord.FFmpegPCMAudio(track.stream_url, **ffmpeg_opts(track.http_headers))
             except Exception as e:  # noqa: BLE001
                 if is_bot_check(e):
                     # Kalan şarkıları denemek işe yaramaz ve engeli sertleştirir: tek mesajla bırak.
